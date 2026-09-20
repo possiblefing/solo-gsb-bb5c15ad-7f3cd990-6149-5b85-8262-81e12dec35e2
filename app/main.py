@@ -42,6 +42,12 @@
   分片；资格判断复用依赖、退避、有效租约与 max_active_leases 规则；并发请求不会重复发放。
   无可发放项时返回各会话的不可用原因及最早 next_retry_at 且不推进游标；成功后才更新游标，
   使连续请求在可用会话间轮转
+- 已提交清单差异（manifest diff）：POST /manifests/diff 接收 base_session_id 与
+  target_session_id，仅比较两个 finalized 会话按分片序号排列的 chunk_digest 序列，
+  生成插入+删除次数之和最小的编辑脚本（多解时固定优先删除再插入），并把连续同类操作
+  合并为携带 base/target 半开区间与对应摘要的区段，单处插入不会导致后续分片全部误报；
+  会话不存在返回 404、未提交返回 409、任一清单超过 2000 项返回 422，
+  相同清单返回覆盖整个清单的单个 equal 区段
 """
 from __future__ import annotations
 
@@ -51,6 +57,7 @@ import json
 import os
 import secrets
 import uuid
+from array import array
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -72,6 +79,9 @@ from .schemas import (
     CoolingChunk,
     CreateDeliveryTicketRequest,
     CreateSessionRequest,
+    DIFF_OP_DELETE,
+    DIFF_OP_EQUAL,
+    DIFF_OP_INSERT,
     DISPATCH_REASON_BACKOFF,
     DISPATCH_REASON_BLOCKED,
     DISPATCH_REASON_DONE,
@@ -92,6 +102,10 @@ from .schemas import (
     ForkSessionResponse,
     LeaseRequest,
     LeaseResponse,
+    MAX_MANIFEST_DIFF_ITEMS,
+    ManifestDiffRequest,
+    ManifestDiffResponse,
+    ManifestDiffSegment,
     ManifestEntry,
     ReadyResponse,
     RedeemDeliveryTicketRequest,
@@ -1565,6 +1579,186 @@ def revoke_delivery_ticket(req: RevokeDeliveryTicketRequest):
         status=TICKET_STATUS_REVOKED,
         revoked_at=now,
         already_revoked=already_revoked,
+    )
+
+
+# ---------------------------------------------------------------- 已提交清单差异
+
+def lcs_suffix_table(a: list[str], b: list[str]):
+    """dp[i][j] = LCS(a[i:], b[j:]) 的长度（后缀 LCS 动态规划表）。
+
+    按行使用 array('H')（无符号短整型，2 字节）：2000×2000 上限下整张表约 8MB，
+    避免 Python int 列表数倍的内存开销；LCS 长度不超过 2000，不会溢出。
+    """
+    m, n = len(a), len(b)
+    width = n + 1
+    dp = [array("H", [0]) * width for _ in range(m + 1)]
+    for i in range(m - 1, -1, -1):
+        row = dp[i]
+        below = dp[i + 1]
+        ai = a[i]
+        for j in range(n - 1, -1, -1):
+            if ai == b[j]:
+                row[j] = below[j + 1] + 1
+            else:
+                down = below[j]
+                right = row[j + 1]
+                row[j] = down if down >= right else right
+    return dp
+
+
+def diff_digest_sequences(
+    base: list[str], target: list[str]
+) -> list[ManifestDiffSegment]:
+    """对两条按分片序号排列的 chunk_digest 序列计算最小编辑脚本（仅插入/删除两种
+    操作，编辑距离 = 插入数 + 删除数 = m + n - 2×LCS），并把连续同类操作合并为区段。
+
+    - 先剥离公共前缀/后缀，仅对中段构建 LCS 表：公共前后缀必然属于某个最优对齐，
+      结果仍是全局最优；相同清单（或仅中段不同）无需构建完整 DP 表；
+    - 多解时固定优先删除再插入：中段回溯中删除与插入同为最优时选择删除，
+      使同一替换位置的 delete 区段固定排在 insert 区段之前，输出完全确定；
+    - 单处插入/删除只影响对应区段，其后的相同分片仍归入 equal 区段，不会全部误报。
+    """
+    m, n = len(base), len(target)
+    prefix = 0
+    while prefix < m and prefix < n and base[prefix] == target[prefix]:
+        prefix += 1
+    suffix = 0
+    while (suffix < m - prefix and suffix < n - prefix
+           and base[m - 1 - suffix] == target[n - 1 - suffix]):
+        suffix += 1
+
+    mid_base = base[prefix:m - suffix]
+    mid_target = target[prefix:n - suffix]
+    mb, nb = len(mid_base), len(mid_target)
+
+    # 中段的操作序列（公共前后缀的 equal 在拼装时补上）
+    if mb and nb:
+        dp = lcs_suffix_table(mid_base, mid_target)
+        middle_ops: list[str] = []
+        i = j = 0
+        while i < mb and j < nb:
+            if mid_base[i] == mid_target[j]:
+                middle_ops.append(DIFF_OP_EQUAL)
+                i += 1
+                j += 1
+            elif dp[i + 1][j] >= dp[i][j + 1]:
+                # 平局（删除与插入同为最优）时固定选择删除：删除先于插入
+                middle_ops.append(DIFF_OP_DELETE)
+                i += 1
+            else:
+                middle_ops.append(DIFF_OP_INSERT)
+                j += 1
+        middle_ops.extend([DIFF_OP_DELETE] * (mb - i))
+        middle_ops.extend([DIFF_OP_INSERT] * (nb - j))
+    else:
+        # 一侧中段为空：剩余部分全部删除（在前）或全部插入（在后）
+        middle_ops = [DIFF_OP_DELETE] * mb + [DIFF_OP_INSERT] * nb
+
+    # 拼装完整操作流并合并连续同类操作；base/target 消费位置同步推进
+    segments: list[ManifestDiffSegment] = []
+    bi = ti = 0  # 下一个待消费操作在 base/target 中的位置
+    seg_op: Optional[str] = None
+    seg_base_start = seg_target_start = 0
+
+    def flush() -> None:
+        segments.append(ManifestDiffSegment(
+            op=seg_op,
+            base_start=seg_base_start,
+            base_end=bi,
+            target_start=seg_target_start,
+            target_end=ti,
+            base_digests=base[seg_base_start:bi],
+            target_digests=target[seg_target_start:ti],
+        ))
+
+    for op in [DIFF_OP_EQUAL] * prefix + middle_ops + [DIFF_OP_EQUAL] * suffix:
+        if op != seg_op:
+            if seg_op is not None:
+                flush()
+            seg_op = op
+            seg_base_start, seg_target_start = bi, ti
+        if op != DIFF_OP_INSERT:
+            bi += 1
+        if op != DIFF_OP_DELETE:
+            ti += 1
+    if seg_op is not None:
+        flush()
+    return segments
+
+
+@app.post(
+    "/manifests/diff",
+    response_model=ManifestDiffResponse,
+    tags=["manifests"],
+    summary="比较两个已提交会话的按序分片清单，返回最小编辑脚本（合并区段）",
+    responses={
+        404: {"description": "base 或 target 会话不存在"},
+        409: {"description": "base 或 target 会话尚未 finalized"},
+        422: {"description": "任一清单超过 2000 项"},
+    },
+)
+def diff_manifests(req: ManifestDiffRequest):
+    """仅比较两个 finalized 会话按分片序号排列的 chunk_digest 序列（不比较
+    file_digest / digest_algorithm 等其它元数据）。finalized 会话只读，
+    清单在读取期间不会变化，与既有只读端点一样无需写锁。"""
+    conn = get_conn()
+    base_session = conn.execute(
+        "SELECT * FROM sessions WHERE id = ?", (req.base_session_id,)
+    ).fetchone()
+    target_session = conn.execute(
+        "SELECT * FROM sessions WHERE id = ?", (req.target_session_id,)
+    ).fetchone()
+    if base_session is None:
+        raise HTTPException(status_code=404, detail="base session not found")
+    if target_session is None:
+        raise HTTPException(status_code=404, detail="target session not found")
+    if base_session["status"] != "finalized":
+        raise HTTPException(status_code=409, detail="base session is not finalized")
+    if target_session["status"] != "finalized":
+        raise HTTPException(status_code=409, detail="target session is not finalized")
+    # finalized 会话的清单长度即 total_chunks；超限时无需加载清单即可拒绝
+    if (base_session["total_chunks"] > MAX_MANIFEST_DIFF_ITEMS
+            or target_session["total_chunks"] > MAX_MANIFEST_DIFF_ITEMS):
+        raise HTTPException(
+            status_code=422,
+            detail=f"manifest exceeds {MAX_MANIFEST_DIFF_ITEMS} items",
+        )
+
+    base_digests = [
+        row["chunk_digest"]
+        for row in conn.execute(
+            "SELECT chunk_digest FROM chunks WHERE session_id = ?"
+            " ORDER BY chunk_index",
+            (req.base_session_id,),
+        ).fetchall()
+    ]
+    target_digests = [
+        row["chunk_digest"]
+        for row in conn.execute(
+            "SELECT chunk_digest FROM chunks WHERE session_id = ?"
+            " ORDER BY chunk_index",
+            (req.target_session_id,),
+        ).fetchall()
+    ]
+
+    segments = diff_digest_sequences(base_digests, target_digests)
+    deletions = sum(
+        s.base_end - s.base_start for s in segments if s.op == DIFF_OP_DELETE
+    )
+    insertions = sum(
+        s.target_end - s.target_start for s in segments if s.op == DIFF_OP_INSERT
+    )
+    return ManifestDiffResponse(
+        base_session_id=req.base_session_id,
+        target_session_id=req.target_session_id,
+        base_total=len(base_digests),
+        target_total=len(target_digests),
+        identical=deletions == 0 and insertions == 0,
+        edit_distance=deletions + insertions,
+        deletions=deletions,
+        insertions=insertions,
+        segments=segments,
     )
 
 

@@ -3109,3 +3109,189 @@ def test_migration_adds_verification_columns_and_tables_to_legacy_database(tmp_p
     assert row[0] == "h2"
     db.run_migrations(migrated)  # 再次执行幂等不报错
     migrated.close()
+
+
+# ---------------------------------------------------------------- 已提交清单差异（manifest diff）
+
+def make_finalized_session(digests):
+    """创建会话、逐分片完成并提交，返回会话 id；digests 按分片序号排列。"""
+    s = make_session(total_chunks=len(digests))
+    for index, digest in enumerate(digests):
+        token = lease(s["id"], index).json()["lease_token"]
+        r = complete(s["id"], index, token, digest)
+        assert r.status_code == 200, r.text
+    fin = client.post(f"/sessions/{s['id']}/finalize")
+    assert fin.status_code == 200, fin.text
+    return s["id"]
+
+
+def finalize_session_via_sql(session_id):
+    """测试辅助：直接落库完成全部分片后走正常 finalize（避免逐片走 HTTP）。"""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE chunks SET status = 'completed',"
+        " chunk_digest = printf('%064d', chunk_index), completed_at = ?"
+        " WHERE session_id = ?",
+        (datetime.now(timezone.utc).isoformat(), session_id),
+    )
+    conn.commit()
+    fin = client.post(f"/sessions/{session_id}/finalize")
+    assert fin.status_code == 200, fin.text
+
+
+def diff_manifests(base_session_id, target_session_id):
+    return client.post(
+        "/manifests/diff",
+        json={"base_session_id": base_session_id,
+              "target_session_id": target_session_id},
+    )
+
+
+def test_manifest_diff_identical_returns_single_equal_segment():
+    digests = [f"{i:064x}" for i in range(4)]
+    base_id = make_finalized_session(digests)
+    target_id = make_finalized_session(digests)
+
+    r = diff_manifests(base_id, target_id)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["identical"] is True
+    assert body["edit_distance"] == 0
+    assert body["deletions"] == 0 and body["insertions"] == 0
+    assert body["base_total"] == 4 and body["target_total"] == 4
+    assert len(body["segments"]) == 1
+    seg = body["segments"][0]
+    assert seg["op"] == "equal"
+    assert (seg["base_start"], seg["base_end"]) == (0, 4)
+    assert (seg["target_start"], seg["target_end"]) == (0, 4)
+    assert seg["base_digests"] == digests
+    assert seg["target_digests"] == digests
+
+    # 会话与自身比较同样是单个 equal 区段
+    assert diff_manifests(base_id, base_id).json()["identical"] is True
+
+
+def test_manifest_diff_single_insert_does_not_shift_following_chunks():
+    a, b, c, x = "a" * 64, "b" * 64, "c" * 64, "d" * 64
+    base_id = make_finalized_session([a, b, c])
+    target_id = make_finalized_session([a, x, b, c])
+
+    body = diff_manifests(base_id, target_id).json()
+    assert body["identical"] is False
+    assert body["edit_distance"] == 1
+    assert body["insertions"] == 1 and body["deletions"] == 0
+    assert [s["op"] for s in body["segments"]] == ["equal", "insert", "equal"]
+    ins = body["segments"][1]
+    assert (ins["base_start"], ins["base_end"]) == (1, 1)  # 空区间：插入位置
+    assert (ins["target_start"], ins["target_end"]) == (1, 2)
+    assert ins["base_digests"] == [] and ins["target_digests"] == [x]
+    tail = body["segments"][2]
+    # 单处插入不影响后续分片：b、c 仍归入 equal 区段，不会全部误报
+    assert (tail["base_start"], tail["base_end"]) == (1, 3)
+    assert (tail["target_start"], tail["target_end"]) == (2, 4)
+    assert tail["base_digests"] == [b, c] == tail["target_digests"]
+
+
+def test_manifest_diff_prefers_delete_before_insert_on_tie():
+    base_id = make_finalized_session(["a" * 64])
+    target_id = make_finalized_session(["b" * 64])
+
+    body = diff_manifests(base_id, target_id).json()
+    assert body["edit_distance"] == 2
+    assert body["deletions"] == 1 and body["insertions"] == 1
+    # 多解时固定优先删除再插入：delete 区段在 insert 区段之前
+    assert [s["op"] for s in body["segments"]] == ["delete", "insert"]
+    delete, insert = body["segments"]
+    assert (delete["base_start"], delete["base_end"]) == (0, 1)
+    assert (delete["target_start"], delete["target_end"]) == (0, 0)
+    assert delete["base_digests"] == ["a" * 64] and delete["target_digests"] == []
+    assert (insert["base_start"], insert["base_end"]) == (1, 1)
+    assert (insert["target_start"], insert["target_end"]) == (0, 1)
+    assert insert["base_digests"] == [] and insert["target_digests"] == ["b" * 64]
+
+
+def test_manifest_diff_merges_consecutive_same_ops():
+    a, d = "a" * 64, "d" * 64
+    base_id = make_finalized_session([a, "b" * 64, "c" * 64, d])
+    target_id = make_finalized_session([a, "e" * 64, "f" * 64, d])
+
+    body = diff_manifests(base_id, target_id).json()
+    assert [s["op"] for s in body["segments"]] == ["equal", "delete", "insert", "equal"]
+    delete = body["segments"][1]
+    assert (delete["base_start"], delete["base_end"]) == (1, 3)  # 连续删除合并为一个区段
+    assert delete["base_digests"] == ["b" * 64, "c" * 64]
+    assert delete["target_digests"] == []
+    insert = body["segments"][2]
+    assert (insert["target_start"], insert["target_end"]) == (1, 3)  # 连续插入同样合并
+    assert insert["target_digests"] == ["e" * 64, "f" * 64]
+    assert insert["base_digests"] == []
+    assert body["edit_distance"] == 4
+    assert body["deletions"] == 2 and body["insertions"] == 2
+
+
+def test_manifest_diff_is_minimal_for_reordered_chunks():
+    a, b, c = "a" * 64, "b" * 64, "c" * 64
+    base_id = make_finalized_session([a, b, c])
+    target_id = make_finalized_session([b, c, a])
+
+    body = diff_manifests(base_id, target_id).json()
+    # LCS = 2（b,c），最小编辑距离 = 3 + 3 - 2×2 = 2
+    assert body["edit_distance"] == 2
+    assert body["deletions"] == 1 and body["insertions"] == 1
+    # 删除优先：删 base 头部的 a，equal 覆盖 b、c，尾部插入 a
+    assert [s["op"] for s in body["segments"]] == ["delete", "equal", "insert"]
+    assert body["segments"][0]["base_digests"] == [a]
+    assert body["segments"][1]["base_digests"] == [b, c]
+    assert body["segments"][2]["target_digests"] == [a]
+
+
+def test_manifest_diff_delete_only_and_insert_only():
+    a, b = "a" * 64, "b" * 64
+    base_id = make_finalized_session([a, b])
+    target_id = make_finalized_session([b])
+
+    body = diff_manifests(base_id, target_id).json()
+    assert [s["op"] for s in body["segments"]] == ["delete", "equal"]
+    assert body["deletions"] == 1 and body["insertions"] == 0
+
+    body = diff_manifests(target_id, base_id).json()
+    assert [s["op"] for s in body["segments"]] == ["insert", "equal"]
+    assert body["deletions"] == 0 and body["insertions"] == 1
+
+
+def test_manifest_diff_unknown_session_returns_404():
+    sid = make_finalized_session(["a" * 64])
+    assert diff_manifests("no-such-session", sid).status_code == 404
+    assert diff_manifests(sid, "no-such-session").status_code == 404
+
+
+def test_manifest_diff_requires_finalized_sessions():
+    finalized_id = make_finalized_session(["a" * 64])
+    active = make_session(total_chunks=1)  # 未提交
+    assert diff_manifests(active["id"], finalized_id).status_code == 409
+    assert diff_manifests(finalized_id, active["id"]).status_code == 409
+
+
+def test_manifest_diff_rejects_manifest_over_2000_items():
+    big = make_session(total_chunks=2001)
+    finalize_session_via_sql(big["id"])
+    small = make_finalized_session(["a" * 64])
+
+    assert diff_manifests(big["id"], small).status_code == 422
+    assert diff_manifests(small, big["id"]).status_code == 422
+
+
+def test_manifest_diff_allows_exactly_2000_items():
+    big = make_session(total_chunks=2000)
+    finalize_session_via_sql(big["id"])
+
+    # target 为首尾两个分片：前缀/后缀剥离后中段为 1998 个连续删除
+    small = make_finalized_session([f"{0:064d}", f"{1999:064d}"])
+    r = diff_manifests(big["id"], small)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["deletions"] == 1998 and body["insertions"] == 0
+    assert [s["op"] for s in body["segments"]] == ["equal", "delete", "equal"]
+    delete = body["segments"][1]
+    assert (delete["base_start"], delete["base_end"]) == (1, 1999)
+    assert len(delete["base_digests"]) == 1998

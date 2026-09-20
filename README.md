@@ -55,6 +55,7 @@ docker compose up --build
 - **交付凭证（delivery ticket，一次性清单领取）**：已 `finalized` 的会话可通过 `POST /sessions/{id}/delivery-tickets`（携带 `expires_in_seconds`，1～365 天）签发**一次性清单领取凭证**。服务端生成高强度随机令牌（`secrets.token_urlsafe(32)`），**明文令牌仅在签发响应中返回一次**；数据库内**只保存令牌的 SHA-256、所属会话、到期时间与状态**（`active` / `consumed` / `revoked`），明文遗失不可找回。同一会话可签发多张相互独立的凭证；`active`（未提交）会话不能签发（`409`）。
   - **兑换**：`POST /delivery-tickets/redeem` 携带 `token` 与调用方生成的幂等键 `request_id`，在**同一写事务**内依次校验**未消费、未撤销、未过期**，通过后原子地把凭证置为 `consumed` 并返回该会话**按分片序号升序的 manifest**（与 finalize 清单一致）及 `redeemed_at`。**并发的不同 `request_id` 只有一个成功**（其余 `409 already consumed`）；**同一 `request_id` 的重放（含并发重试）返回与首次完全相同的结果**——首次响应被原样持久化，即使此后凭证已过期或被撤销。已撤销（`409 revoked`）、已过期（`409 expired`）或已被其它 `request_id` 消费（`409 already consumed`）的凭证均不可领取；未知令牌返回 `404`。
   - **撤销**：`POST /delivery-tickets/revoke` 携带 `token`，将未消费凭证置为 `revoked`（**已消费凭证不可撤销**，返回 `409`；已过期但未消费的凭证仍可撤销）；对已撤销凭证重复撤销幂等成功（`already_revoked: true`）。撤销后任何兑换请求都返回 `409`。
+- **已提交清单差异（manifest diff）**：`POST /manifests/diff` 接收 `base_session_id` 与 `target_session_id`，仅比较两个 **finalized** 会话按分片序号排列的 `chunk_digest` 序列，返回**插入+删除次数之和最小**的编辑脚本（多解时**固定优先删除再插入**），连续同类操作合并为携带 base/target **半开区间**与对应摘要的区段——单处分片插入只产生一个 insert 区段，其后的相同分片仍归入 equal 区段，不会全部误报。会话不存在 `404`、未提交 `409`、任一清单超过 **2000** 项 `422`；两份清单完全一致时返回覆盖整个清单的**单个 equal 区段**（见下文「已提交清单差异」）。
 - 已完成的分片不可再领取租约；已提交的会话进入只读状态。
 
 ## 分片验收队列（verification_required，可选）
@@ -249,6 +250,7 @@ curl -s -X POST http://localhost:8000/sessions/$SID/finalize
 | `POST` | `/sessions/{session_id}/delivery-tickets` | 为已 finalized 会话签发一次性清单领取凭证（明文 token 仅此一次返回，库内只存 SHA-256/会话/到期/状态） |
 | `POST` | `/delivery-tickets/redeem` | 凭 token + 幂等 `request_id` 兑换按序 manifest（一次性；并发不同 request_id 仅一个成功，同 request_id 重放返回首次结果） |
 | `POST` | `/delivery-tickets/revoke` | 撤销未消费凭证（已消费不可撤销；重复撤销幂等，撤销后不可兑换） |
+| `POST` | `/manifests/diff` | 比较两个已提交会话的按序分片清单：返回插入+删除次数之和最小的编辑脚本（多解时固定优先删除再插入），连续同类操作合并为携带半开区间与摘要的区段；`404`/`409`/`422` |
 | `POST` | `/verifications/lease` | 按完成时间 FIFO 领取一个待验收分片并签发有 TTL 的验收令牌（未过期独占、过期可重领、并发不重复） |
 | `POST` | `/verifications/{session_id}/{chunk_index}/decide` | 凭当前验收令牌 approve（转 completed）或 reject（清除摘要回 pending）；同令牌同决定幂等、冲突决定 409 |
 | `GET` | `/healthz` | 健康检查 |
@@ -623,6 +625,70 @@ curl -s -X POST http://localhost:8000/delivery-tickets/revoke \
 注意签发与撤销都需要凭证明文；库内无法从 SHA-256 反推出令牌，因此明文丢失后
 只能重新签发（必要时等旧凭证自然过期）。
 
+## 已提交清单差异（manifest diff，curl）
+
+`POST /manifests/diff` 比较两个**已提交（finalized）**会话按分片序号排列的
+`chunk_digest` 序列，回答「两份交付清单之间差了哪些分片」。服务默认监听
+`http://localhost:8000`（端口映射见「快速启动」，以下示例均用该地址）。
+
+请求体：
+
+```json
+{"base_session_id": "<基准会话id>", "target_session_id": "<目标会话id>"}
+```
+
+规则要点：
+
+- **最小编辑脚本**：仅使用插入/删除两种操作，服务端保证**插入次数 + 删除次数之和
+  最小**（= m + n − 2×LCS）；`edit_distance` 即该最小值，`deletions` / `insertions`
+  为分项计数。
+- **多解时固定优先删除再插入**：同一替换位置既有删除又有插入时，`delete` 区段固定
+  排在 `insert` 区段之前，输出完全确定。
+- **区段合并**：连续同类操作合并为一个区段，携带 base/target 两侧的**半开区间**
+  `[base_start, base_end)` / `[target_start, target_end)` 与对应摘要
+  （`base_digests` / `target_digests`；insert 区段无 base 摘要、delete 区段无
+  target 摘要）。单处分片插入只产生一个 insert 区段，其后的相同分片仍归入 equal
+  区段，不会全部误报。
+- **错误码**：任一会话不存在 `404`；任一会话未 finalized `409`；任一清单超过
+  **2000** 项 `422`；两份清单完全一致时返回覆盖整个清单的**单个 equal 区段**
+  （`identical: true`、`edit_distance: 0`）。
+
+```bash
+# 前置：两个会话均已 finalize。设 base 清单为 [A,B,C]，target 清单为 [A,X,B,C]
+# （在分片 1 处插入 X），摘要均为 64 位十六进制
+BASE=...; TARGET=...
+
+curl -s -X POST http://localhost:8000/manifests/diff \
+  -H 'Content-Type: application/json' \
+  -d "{\"base_session_id\": \"$BASE\", \"target_session_id\": \"$TARGET\"}"
+# => 200 {
+#      "base_session_id": "...", "target_session_id": "...",
+#      "base_total": 3, "target_total": 4,
+#      "identical": false, "edit_distance": 1,
+#      "deletions": 0, "insertions": 1,
+#      "segments": [
+#        {"op": "equal",  "base_start": 0, "base_end": 1,
+#         "target_start": 0, "target_end": 1,
+#         "base_digests": ["A"], "target_digests": ["A"]},
+#        {"op": "insert", "base_start": 1, "base_end": 1,
+#         "target_start": 1, "target_end": 2,
+#         "base_digests": [], "target_digests": ["X"]},
+#        {"op": "equal",  "base_start": 1, "base_end": 3,
+#         "target_start": 2, "target_end": 4,
+#         "base_digests": ["B", "C"], "target_digests": ["B", "C"]}
+#      ]
+#    }
+# 单处插入只产生一个 insert 区段，其后的 B、C 仍在 equal 区段中
+
+# 替换场景（base [A] -> target [B]）：多解时固定优先删除再插入
+# => "segments": [
+#      {"op": "delete", "base_start": 0, "base_end": 1,
+#       "target_start": 0, "target_end": 0, "base_digests": ["A"], "target_digests": []},
+#      {"op": "insert", "base_start": 1, "base_end": 1,
+#       "target_start": 0, "target_end": 1, "base_digests": [], "target_digests": ["B"]}
+#    ]
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -644,7 +710,7 @@ app/
   db.py        # SQLite 连接与建库建表（启动时自动执行）
   schemas.py   # Pydantic 请求/响应模型
 tests/
-  test_api.py  # 租约独占/过期、幂等、提交、交付凭证、分片验收队列等端到端行为测试
+  test_api.py  # 租约独占/过期、幂等、提交、交付凭证、分片验收队列、清单差异等端到端行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -585,3 +585,56 @@ class VerificationDecideResponse(BaseModel):
     decided_at: datetime = Field(description="首次决定时间（同令牌重放保持首次值）")
     idempotent_replay: bool = Field(
         default=False, description="是否为同一令牌同一决定的幂等重放")
+
+
+# ---------------------------------------------------------------- 已提交清单差异（manifest diff）
+
+# 区段操作类型：equal（两区间摘要序列完全一致）| delete（base 有而 target 没有）
+# | insert（target 有而 base 没有）
+DIFF_OP_EQUAL = "equal"
+DIFF_OP_DELETE = "delete"
+DIFF_OP_INSERT = "insert"
+
+# 参与 diff 的单侧清单最大分片数：最小编辑脚本基于 O(m×n) 的 LCS 动态规划，
+# 超过该上限拒绝（422），保证单次比较的时间与内存有界
+MAX_MANIFEST_DIFF_ITEMS = 2000
+
+
+class ManifestDiffRequest(BaseModel):
+    base_session_id: str = Field(
+        min_length=1, max_length=128,
+        description="基准（base）会话 id：必须已 finalized")
+    target_session_id: str = Field(
+        min_length=1, max_length=128,
+        description="目标（target）会话 id：必须已 finalized")
+
+
+class ManifestDiffSegment(BaseModel):
+    op: str = Field(description="区段操作：equal | delete | insert")
+    base_start: int = Field(description="base 清单半开区间起点（含），按分片序号")
+    base_end: int = Field(
+        description="base 清单半开区间终点（不含）；insert 区段恒等于 base_start（空区间）")
+    target_start: int = Field(description="target 清单半开区间起点（含），按分片序号")
+    target_end: int = Field(
+        description="target 清单半开区间终点（不含）；delete 区段恒等于 target_start（空区间）")
+    base_digests: list[str] = Field(
+        description="base 半开区间对应的 chunk_digest 序列；insert 区段为空列表")
+    target_digests: list[str] = Field(
+        description="target 半开区间对应的 chunk_digest 序列；delete 区段为空列表")
+
+
+class ManifestDiffResponse(BaseModel):
+    base_session_id: str
+    target_session_id: str
+    base_total: int = Field(description="base 清单的分片数")
+    target_total: int = Field(description="target 清单的分片数")
+    identical: bool = Field(
+        description="两条摘要序列完全一致：此时 segments 为覆盖整个清单的单个 equal 区段")
+    edit_distance: int = Field(
+        description="最小编辑距离 = deletions + insertions"
+                    "（服务端已按插入+删除次数之和最小化）")
+    deletions: int = Field(description="删除分片总数：全部 delete 区段的 base 区间长度之和")
+    insertions: int = Field(description="插入分片总数：全部 insert 区段的 target 区间长度之和")
+    segments: list[ManifestDiffSegment] = Field(
+        description="按清单顺序排列的合并区段：连续同类操作已合并；多解时固定优先删除再插入，"
+                    "同一替换位置的 delete 区段总是排在 insert 区段之前")

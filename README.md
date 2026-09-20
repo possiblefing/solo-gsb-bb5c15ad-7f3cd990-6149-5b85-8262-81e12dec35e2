@@ -36,6 +36,7 @@ docker compose up --build
 | `MAX_VERIFICATION_TTL_SECONDS` | `3600` | 验收令牌有效期上限（秒），缺省跟随 `MAX_LEASE_TTL_SECONDS` |
 | `DEFAULT_BASE_RETRY_SECONDS` | `5` | 创建会话未显式指定时的失败退避基数（秒） |
 | `DEFAULT_MAX_RETRY_SECONDS` | `300` | 创建会话未显式指定时的失败退避冷却上限（秒） |
+| `MAX_MANIFEST_DIFF_ENTRIES` | `2000` | `/manifests/diff` 允许比较的清单项数上限，任一清单超出返回 `422` |
 
 端口映射默认为宿主机 `8000` → 容器 `8000`，可在 `docker-compose.yml` 的 `ports` 中修改。
 
@@ -249,6 +250,7 @@ curl -s -X POST http://localhost:8000/sessions/$SID/finalize
 | `POST` | `/sessions/{session_id}/delivery-tickets` | 为已 finalized 会话签发一次性清单领取凭证（明文 token 仅此一次返回，库内只存 SHA-256/会话/到期/状态） |
 | `POST` | `/delivery-tickets/redeem` | 凭 token + 幂等 `request_id` 兑换按序 manifest（一次性；并发不同 request_id 仅一个成功，同 request_id 重放返回首次结果） |
 | `POST` | `/delivery-tickets/revoke` | 撤销未消费凭证（已消费不可撤销；重复撤销幂等，撤销后不可兑换） |
+| `POST` | `/manifests/diff` | 比较两个已提交会话的按序分片摘要，生成插入+删除次数最少的编辑脚本（多解时固定删除优先，连续同类操作合并为带半开区间的区段） |
 | `POST` | `/verifications/lease` | 按完成时间 FIFO 领取一个待验收分片并签发有 TTL 的验收令牌（未过期独占、过期可重领、并发不重复） |
 | `POST` | `/verifications/{session_id}/{chunk_index}/decide` | 凭当前验收令牌 approve（转 completed）或 reject（清除摘要回 pending）；同令牌同决定幂等、冲突决定 409 |
 | `GET` | `/healthz` | 健康检查 |
@@ -623,6 +625,55 @@ curl -s -X POST http://localhost:8000/delivery-tickets/revoke \
 注意签发与撤销都需要凭证明文；库内无法从 SHA-256 反推出令牌，因此明文丢失后
 只能重新签发（必要时等旧凭证自然过期）。
 
+## 已提交清单差异（manifest diff）
+
+`POST /manifests/diff`（与其它接口同在 `8000` 端口）比较**两个已 finalized 会话**的
+交付清单：仅按分片序号升序取出两侧的 `chunk_digest` 序列，生成把 base 清单变换为
+target 清单的**最小编辑脚本**（只读，不落库）。
+
+规则要点：
+
+- **请求体**：`{"base_session_id": "...", "target_session_id": "..."}`。
+- **最小编辑脚本**：脚本中插入、删除次数之和最少（等于 `(n - L) + (m - L)`，L 为两
+  序列的最长公共子序列长度，服务端以 LCS 动态规划求解）；存在多解时**固定优先删除
+  再插入**，输出完全确定。
+- **区段合并**：连续同类操作合并为一个区段，携带 `op`（`equal` / `delete` /
+  `insert`）、base 与 target 的**半开区间**（`base_start`/`base_end`、
+  `target_start`/`target_end`，下标即分片序号；insert 区段的 base 区间为空、
+  delete 区段的 target 区间为空）及该区段对应的 `digests` 摘要序列。单处分片的
+  插入/删除只会产生一个小区段，后续相同分片仍落在 `equal` 区段，不会被逐位比较
+  误报为全部变更。响应同时给出 `deletions` / `insertions` 总次数。
+- **相同清单**：两份清单完全一致（含与自身比较）时返回**单个 equal 区段**。
+- **错误码**：任一会话不存在返回 `404`；任一会话未 finalized 返回 `409`；任一清单
+  超过 `MAX_MANIFEST_DIFF_ENTRIES` 项（默认 `2000`，可用同名环境变量调整）返回
+  `422`（响应体含 `max_entries` 与两侧 `base_total` / `target_total`）。
+
+```bash
+# 前置：两个会话均已 finalize（创建、逐分片领取/完成、提交，同前）
+BASE=...; TARGET=...
+
+curl -s -X POST http://localhost:8000/manifests/diff \
+  -H 'Content-Type: application/json' \
+  -d "{\"base_session_id\": \"$BASE\", \"target_session_id\": \"$TARGET\"}"
+# => 200 {
+#      "base_session_id": "...", "target_session_id": "...",
+#      "base_total": 4, "target_total": 4,
+#      "deletions": 2, "insertions": 2,
+#      "segments": [
+#        {"op": "equal",  "base_start": 0, "base_end": 1,
+#         "target_start": 0, "target_end": 1, "digests": ["aa..."]},
+#        {"op": "delete", "base_start": 1, "base_end": 3,
+#         "target_start": 1, "target_end": 1, "digests": ["bb...", "cc..."]},
+#        {"op": "insert", "base_start": 3, "base_end": 3,
+#         "target_start": 1, "target_end": 3, "digests": ["xx...", "yy..."]},
+#        {"op": "equal",  "base_start": 3, "base_end": 4,
+#         "target_start": 3, "target_end": 4, "digests": ["dd..."]}
+#      ]
+#    }
+# 依次应用各区段（equal 保留、delete 跳过、insert 补入）即可把 base 清单
+# 变换为 target 清单；两份清单完全相同时 segments 为单个 equal 区段。
+```
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -644,7 +695,7 @@ app/
   db.py        # SQLite 连接与建库建表（启动时自动执行）
   schemas.py   # Pydantic 请求/响应模型
 tests/
-  test_api.py  # 租约独占/过期、幂等、提交、交付凭证、分片验收队列等端到端行为测试
+  test_api.py  # 租约独占/过期、幂等、提交、交付凭证、分片验收队列、清单差异等端到端行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt

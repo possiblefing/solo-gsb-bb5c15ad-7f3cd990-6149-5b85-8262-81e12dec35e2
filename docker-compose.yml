@@ -12,6 +12,7 @@ services:
       MAX_VERIFICATION_TTL_SECONDS: "3600"
       DEFAULT_BASE_RETRY_SECONDS: "5"
       DEFAULT_MAX_RETRY_SECONDS: "300"
+      MAX_MANIFEST_DIFF_ENTRIES: "2000"
     volumes:
       - coordinator-data:/data
     restart: unless-stopped

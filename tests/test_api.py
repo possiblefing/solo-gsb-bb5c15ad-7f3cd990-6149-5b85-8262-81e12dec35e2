@@ -3109,3 +3109,267 @@ def test_migration_adds_verification_columns_and_tables_to_legacy_database(tmp_p
     assert row[0] == "h2"
     db.run_migrations(migrated)  # 再次执行幂等不报错
     migrated.close()
+
+
+# ---------------------------------------------------------------- 已提交清单差异
+
+def make_finalized_session(digests):
+    """创建会话、逐分片完成并提交；返回 session_id。"""
+    s = make_session(total_chunks=len(digests))
+    for i, digest in enumerate(digests):
+        token = lease(s["id"], i).json()["lease_token"]
+        assert complete(s["id"], i, token, digest).status_code == 200
+    resp = client.post(f"/sessions/{s['id']}/finalize")
+    assert resp.status_code == 200, resp.text
+    return s["id"]
+
+
+def manifest_diff(base_id, target_id):
+    return client.post("/manifests/diff", json={
+        "base_session_id": base_id,
+        "target_session_id": target_id,
+    })
+
+
+def apply_diff_segments(base_digests, target_digests, segments):
+    """校验各区段的半开区间与摘要和两侧清单一致（且连续覆盖两个序列），
+    并把编辑脚本应用到 base 上，返回得到的摘要序列。"""
+    out = []
+    base_pos = target_pos = 0
+    for seg in segments:
+        assert seg["base_start"] == base_pos
+        assert seg["target_start"] == target_pos
+        if seg["op"] == "equal":
+            assert seg["digests"] == base_digests[seg["base_start"]:seg["base_end"]]
+            assert seg["digests"] == target_digests[seg["target_start"]:seg["target_end"]]
+            out.extend(seg["digests"])
+        elif seg["op"] == "delete":
+            assert seg["target_start"] == seg["target_end"]
+            assert seg["digests"] == base_digests[seg["base_start"]:seg["base_end"]]
+        else:
+            assert seg["op"] == "insert"
+            assert seg["base_start"] == seg["base_end"]
+            assert seg["digests"] == target_digests[seg["target_start"]:seg["target_end"]]
+            out.extend(seg["digests"])
+        base_pos = seg["base_end"]
+        target_pos = seg["target_end"]
+    assert base_pos == len(base_digests)
+    assert target_pos == len(target_digests)
+    return out
+
+
+def test_manifest_diff_identical_returns_single_equal_segment():
+    digests = [c * 64 for c in "abcd"]
+    base_id = make_finalized_session(digests)
+    target_id = make_finalized_session(digests)
+
+    r = manifest_diff(base_id, target_id)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["base_total"] == 4 and body["target_total"] == 4
+    assert body["deletions"] == 0 and body["insertions"] == 0
+    assert len(body["segments"]) == 1
+    seg = body["segments"][0]
+    assert seg["op"] == "equal"
+    assert (seg["base_start"], seg["base_end"]) == (0, 4)
+    assert (seg["target_start"], seg["target_end"]) == (0, 4)
+    assert seg["digests"] == digests
+
+    # 与自身比较同样是单个 equal 区段
+    r = manifest_diff(base_id, base_id)
+    assert r.status_code == 200
+    assert [s["op"] for s in r.json()["segments"]] == ["equal"]
+
+
+def test_manifest_diff_single_insert_does_not_shift_tail():
+    base_digests = [c * 64 for c in "abcd"]
+    target_digests = [c * 64 for c in "ab"] + ["x" * 64] + [c * 64 for c in "cd"]
+    base_id = make_finalized_session(base_digests)
+    target_id = make_finalized_session(target_digests)
+
+    body = manifest_diff(base_id, target_id).json()
+    assert body["insertions"] == 1 and body["deletions"] == 0
+    assert [s["op"] for s in body["segments"]] == ["equal", "insert", "equal"]
+    insert_seg = body["segments"][1]
+    assert (insert_seg["base_start"], insert_seg["base_end"]) == (2, 2)
+    assert (insert_seg["target_start"], insert_seg["target_end"]) == (2, 3)
+    assert insert_seg["digests"] == ["x" * 64]
+    # 插入点之后的相同分片全部落在 equal 区段，不被逐位比较误报为变更
+    tail = body["segments"][2]
+    assert (tail["base_start"], tail["base_end"]) == (2, 4)
+    assert (tail["target_start"], tail["target_end"]) == (3, 5)
+    assert tail["digests"] == [c * 64 for c in "cd"]
+    assert apply_diff_segments(base_digests, target_digests, body["segments"]) == target_digests
+
+
+def test_manifest_diff_merges_runs_and_prefers_delete_before_insert():
+    base_digests = [c * 64 for c in "abcd"]
+    target_digests = ["a" * 64, "x" * 64, "y" * 64, "d" * 64]
+    base_id = make_finalized_session(base_digests)
+    target_id = make_finalized_session(target_digests)
+
+    body = manifest_diff(base_id, target_id).json()
+    # 连续删除/连续插入各合并为一个区段；多解时固定删除区段在前、插入区段在后
+    assert [s["op"] for s in body["segments"]] == ["equal", "delete", "insert", "equal"]
+    delete_seg, insert_seg = body["segments"][1], body["segments"][2]
+    assert delete_seg["digests"] == ["b" * 64, "c" * 64]
+    assert (delete_seg["base_start"], delete_seg["base_end"]) == (1, 3)
+    assert (delete_seg["target_start"], delete_seg["target_end"]) == (1, 1)
+    assert insert_seg["digests"] == ["x" * 64, "y" * 64]
+    assert (insert_seg["base_start"], insert_seg["base_end"]) == (3, 3)
+    assert (insert_seg["target_start"], insert_seg["target_end"]) == (1, 3)
+    assert body["deletions"] == 2 and body["insertions"] == 2
+    assert apply_diff_segments(base_digests, target_digests, body["segments"]) == target_digests
+
+
+def test_manifest_diff_is_minimal_for_moved_chunk():
+    # 首分片移动到末尾：最小编辑脚本为 1 次删除 + 1 次插入，而非整段删除重写
+    base_digests = [c * 64 for c in "abcd"]
+    target_digests = [c * 64 for c in "bcd"] + ["a" * 64]
+    base_id = make_finalized_session(base_digests)
+    target_id = make_finalized_session(target_digests)
+
+    body = manifest_diff(base_id, target_id).json()
+    assert body["deletions"] == 1 and body["insertions"] == 1
+    assert [s["op"] for s in body["segments"]] == ["delete", "equal", "insert"]
+    assert apply_diff_segments(base_digests, target_digests, body["segments"]) == target_digests
+
+
+def test_manifest_diff_completely_different_manifests():
+    base_digests = ["a" * 64, "b" * 64]
+    target_digests = ["x" * 64, "y" * 64, "z" * 64]
+    base_id = make_finalized_session(base_digests)
+    target_id = make_finalized_session(target_digests)
+
+    body = manifest_diff(base_id, target_id).json()
+    assert [s["op"] for s in body["segments"]] == ["delete", "insert"]
+    assert body["deletions"] == 2 and body["insertions"] == 3
+    assert apply_diff_segments(base_digests, target_digests, body["segments"]) == target_digests
+
+
+def test_manifest_diff_with_duplicate_digests():
+    # 摘要重复出现时仍须给出最小编辑脚本（删除尾部重复项即可）
+    base_digests = ["a" * 64, "b" * 64, "a" * 64]
+    target_digests = ["b" * 64, "a" * 64]
+    base_id = make_finalized_session(base_digests)
+    target_id = make_finalized_session(target_digests)
+
+    body = manifest_diff(base_id, target_id).json()
+    assert body["deletions"] == 1 and body["insertions"] == 0
+    assert [s["op"] for s in body["segments"]] == ["delete", "equal"]
+    assert body["segments"][0]["digests"] == ["a" * 64]
+    assert apply_diff_segments(base_digests, target_digests, body["segments"]) == target_digests
+
+
+def test_manifest_diff_requires_existing_sessions():
+    sid = make_finalized_session(["a" * 64])
+    assert manifest_diff("no-such-session", sid).status_code == 404
+    assert manifest_diff(sid, "no-such-session").status_code == 404
+
+
+def test_manifest_diff_requires_finalized_sessions():
+    active_id = make_session(total_chunks=1)["id"]
+    finalized_id = make_finalized_session(["a" * 64])
+
+    r = manifest_diff(active_id, finalized_id)
+    assert r.status_code == 409
+    assert r.json()["session_id"] == active_id
+    r = manifest_diff(finalized_id, active_id)
+    assert r.status_code == 409
+    assert r.json()["session_id"] == active_id
+    # 双方都已提交后才能比较
+    assert manifest_diff(finalized_id, finalized_id).status_code == 200
+
+
+def test_manifest_diff_rejects_oversized_manifest():
+    big = make_session(total_chunks=2001)
+    small_id = make_finalized_session(["a" * 64])
+    # 直接落库为已提交（避免逐分片上报），清单项数即 total_chunks
+    get_conn().execute(
+        "UPDATE sessions SET status = 'finalized',"
+        " finalized_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+        (big["id"],),
+    )
+    get_conn().commit()
+
+    r = manifest_diff(big["id"], small_id)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["max_entries"] == 2000
+    assert body["base_total"] == 2001
+    assert body["target_total"] == 1
+    # target 超限同样 422
+    assert manifest_diff(small_id, big["id"]).status_code == 422
+
+    # 恰好 2000 项可以比较
+    exactly = make_session(total_chunks=2000)
+    get_conn().execute(
+        "UPDATE sessions SET status = 'finalized',"
+        " finalized_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+        (exactly["id"],),
+    )
+    get_conn().execute(
+        "UPDATE chunks SET status = 'completed',"
+        " chunk_digest = printf('%064x', chunk_index),"
+        " completed_at = '2026-01-01T00:00:00+00:00' WHERE session_id = ?",
+        (exactly["id"],),
+    )
+    get_conn().commit()
+    r = manifest_diff(exactly["id"], small_id)
+    assert r.status_code == 200, r.text
+    assert r.json()["base_total"] == 2000
+
+
+def test_minimal_edit_script_tiebreak_and_move():
+    from app.main import minimal_edit_script
+
+    # 多解时固定优先删除再插入
+    ops = minimal_edit_script(["a"], ["b"])
+    assert [op for op, _ in ops] == ["delete", "insert"]
+    # 单元素移动到队首：1 次删除 + 1 次插入
+    ops = minimal_edit_script(["a", "b", "c"], ["b", "c", "a"])
+    assert [op for op, _ in ops] == ["delete", "equal", "equal", "insert"]
+
+
+def test_minimal_edit_script_matches_lcs_lower_bound():
+    """随机小规模序列：脚本可还原 target，且插入+删除次数达到 LCS 下界（即最少）。"""
+    import random
+
+    from app.main import minimal_edit_script
+
+    def lcs_len(a, b):
+        prev = [0] * (len(b) + 1)
+        for x in a:
+            cur = [0]
+            for j, y in enumerate(b):
+                cur.append(prev[j] + 1 if x == y else max(prev[j + 1], cur[j]))
+            prev = cur
+        return prev[-1]
+
+    rng = random.Random(20260920)
+    for _ in range(200):
+        base = [rng.choice("abcd") for _ in range(rng.randrange(12))]
+        target = [rng.choice("abcd") for _ in range(rng.randrange(12))]
+        ops = minimal_edit_script(base, target)
+        out, base_pos, target_pos = [], 0, 0
+        cost = 0
+        for op, digest in ops:
+            if op == "equal":
+                assert digest == base[base_pos] == target[target_pos]
+                out.append(digest)
+                base_pos += 1
+                target_pos += 1
+            elif op == "delete":
+                assert digest == base[base_pos]
+                base_pos += 1
+                cost += 1
+            else:
+                assert op == "insert"
+                assert digest == target[target_pos]
+                out.append(digest)
+                target_pos += 1
+                cost += 1
+        assert (base_pos, target_pos) == (len(base), len(target))
+        assert out == target
+        lcs = lcs_len(base, target)
+        assert cost == (len(base) - lcs) + (len(target) - lcs)

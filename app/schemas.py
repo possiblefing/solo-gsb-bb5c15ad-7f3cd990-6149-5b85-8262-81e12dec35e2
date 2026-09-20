@@ -396,6 +396,49 @@ class FinalizeResponse(BaseModel):
     finalized_at: datetime
 
 
+# ---------------------------------------------------------------- 清单差异（manifest diff）
+
+# 编辑脚本区段的操作类型：equal（两段相同）| delete（从 base 删除）| insert（向 base 插入 target 内容）
+DIFF_OP_EQUAL = "equal"
+DIFF_OP_DELETE = "delete"
+DIFF_OP_INSERT = "insert"
+
+
+class ManifestDiffRequest(BaseModel):
+    base_session_id: str = Field(
+        min_length=1, max_length=128,
+        description="基准会话 id：编辑脚本以该会话的按序清单为被修改对象；必须已 finalized")
+    target_session_id: str = Field(
+        min_length=1, max_length=128,
+        description="目标会话 id：编辑脚本把基准清单变换为该会话的按序清单；必须已 finalized")
+
+
+class ManifestDiffSegment(BaseModel):
+    op: Literal["equal", "delete", "insert"] = Field(
+        description="区段操作：equal（两侧相同）| delete（仅存在于 base）| insert（仅存在于 target）")
+    base_start: int = Field(description="区段在 base 清单中的半开区间起点（分片序号下标）")
+    base_end: int = Field(
+        description="区段在 base 清单中的半开区间终点；insert 区段不消费 base，base_end == base_start")
+    target_start: int = Field(description="区段在 target 清单中的半开区间起点（分片序号下标）")
+    target_end: int = Field(
+        description="区段在 target 清单中的半开区间终点；delete 区段不消费 target，target_end == target_start")
+    digests: list[str] = Field(
+        description="该区段对应的摘要序列：equal 为两侧共同摘要、delete 为被删除的 base 摘要、"
+                    "insert 为待插入的 target 摘要，均按分片序号升序")
+
+
+class ManifestDiffResponse(BaseModel):
+    base_session_id: str
+    target_session_id: str
+    base_total: int = Field(description="base 清单的分片总数")
+    target_total: int = Field(description="target 清单的分片总数")
+    deletions: int = Field(description="编辑脚本中的删除次数（被删除的 base 分片数）")
+    insertions: int = Field(description="编辑脚本中的插入次数（待插入的 target 分片数）")
+    segments: list[ManifestDiffSegment] = Field(
+        description="按序排列的编辑脚本区段：连续同类操作已合并；依次应用即可把 base 清单"
+                    "变换为 target 清单。两份清单完全相同时为单个 equal 区段")
+
+
 # ---------------------------------------------------------------- 交付凭证（delivery ticket）
 
 # 凭证状态机：active（未消费、未撤销）| consumed（已兑换，恰好一次）| revoked（已撤销）

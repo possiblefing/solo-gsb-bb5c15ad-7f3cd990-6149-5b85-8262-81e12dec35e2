@@ -42,6 +42,11 @@
   分片；资格判断复用依赖、退避、有效租约与 max_active_leases 规则；并发请求不会重复发放。
   无可发放项时返回各会话的不可用原因及最早 next_retry_at 且不推进游标；成功后才更新游标，
   使连续请求在可用会话间轮转
+- 已提交清单差异：POST /manifests/diff 携带 base_session_id 与 target_session_id，
+  仅比较两个 finalized 会话按分片序号升序的 chunk_digest 序列，生成插入+删除次数最少的
+  编辑脚本（LCS 动态规划，多解时固定优先删除再插入），连续同类操作合并为携带 base/target
+  半开区间与对应摘要的区段；会话不存在返回 404、未提交返回 409、任一清单超过
+  MAX_MANIFEST_DIFF_ENTRIES 项返回 422；相同清单返回单个 equal 区段
 """
 from __future__ import annotations
 
@@ -51,6 +56,7 @@ import json
 import os
 import secrets
 import uuid
+from array import array
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -72,6 +78,9 @@ from .schemas import (
     CoolingChunk,
     CreateDeliveryTicketRequest,
     CreateSessionRequest,
+    DIFF_OP_DELETE,
+    DIFF_OP_EQUAL,
+    DIFF_OP_INSERT,
     DISPATCH_REASON_BACKOFF,
     DISPATCH_REASON_BLOCKED,
     DISPATCH_REASON_DONE,
@@ -92,6 +101,9 @@ from .schemas import (
     ForkSessionResponse,
     LeaseRequest,
     LeaseResponse,
+    ManifestDiffRequest,
+    ManifestDiffResponse,
+    ManifestDiffSegment,
     ManifestEntry,
     ReadyResponse,
     RedeemDeliveryTicketRequest,
@@ -125,6 +137,7 @@ MAX_VERIFICATION_TTL_SECONDS = int(
 )
 DEFAULT_BASE_RETRY_SECONDS = int(os.environ.get("DEFAULT_BASE_RETRY_SECONDS", "5"))
 DEFAULT_MAX_RETRY_SECONDS = int(os.environ.get("DEFAULT_MAX_RETRY_SECONDS", "300"))
+MAX_MANIFEST_DIFF_ENTRIES = int(os.environ.get("MAX_MANIFEST_DIFF_ENTRIES", "2000"))
 
 
 def utcnow() -> datetime:
@@ -1568,6 +1581,163 @@ def revoke_delivery_ticket(req: RevokeDeliveryTicketRequest):
     )
 
 
+# ---------------------------------------------------------------- 已提交清单差异
+
+def minimal_edit_script(base: list[str], target: list[str]) -> list[tuple[str, str]]:
+    """生成把 base 摘要序列变换为 target 摘要序列的最小编辑脚本。
+
+    返回 (op, digest) 操作列表，op ∈ {equal, delete, insert}；脚本中删除与插入
+    次数之和最小（等于 (n - L) + (m - L)，L 为两序列的最长公共子序列长度）。
+    多解时固定“优先删除再插入”：回溯 LCS 动态规划表时，删除与插入同为最优
+    一律选择删除，输出完全确定。先剥离公共前后缀再仅对差异中段做 DP——
+    公共前后缀必然属于某个最优对齐，结果与全序列 DP 一致，且单处分片
+    插入/删除只会让对应位置出现一个小区段，后续相同分片不会被误报为变更。
+    """
+    n, m = len(base), len(target)
+    # 公共前缀长度
+    pre = 0
+    while pre < n and pre < m and base[pre] == target[pre]:
+        pre += 1
+    # 公共后缀长度（不与前缀重叠）
+    suf = 0
+    while suf < n - pre and suf < m - pre and base[n - 1 - suf] == target[m - 1 - suf]:
+        suf += 1
+
+    ops: list[tuple[str, str]] = [(DIFF_OP_EQUAL, d) for d in base[:pre]]
+    mid_base = base[pre:n - suf]
+    mid_target = target[pre:m - suf]
+
+    if mid_base and mid_target:
+        # dp[i][j] = LCS(mid_base[i:], mid_target[j:]) 的长度；
+        # 长度不超过 MAX_MANIFEST_DIFF_ENTRIES（2000），用 16 位无符号整数存储
+        bn, bm = len(mid_base), len(mid_target)
+        dp = [array("H", bytes(2 * (bm + 1))) for _ in range(bn + 1)]
+        for i in range(bn - 1, -1, -1):
+            row, below = dp[i], dp[i + 1]
+            base_i = mid_base[i]
+            for j in range(bm - 1, -1, -1):
+                if base_i == mid_target[j]:
+                    row[j] = below[j + 1] + 1
+                else:
+                    delete_cost, insert_cost = below[j], row[j + 1]
+                    row[j] = delete_cost if delete_cost >= insert_cost else insert_cost
+        i = j = 0
+        while i < bn and j < bm:
+            if mid_base[i] == mid_target[j]:
+                ops.append((DIFF_OP_EQUAL, mid_base[i]))
+                i += 1
+                j += 1
+            elif dp[i + 1][j] >= dp[i][j + 1]:
+                # 删除与插入同为最优时固定选择删除（多解时的确定性规则）
+                ops.append((DIFF_OP_DELETE, mid_base[i]))
+                i += 1
+            else:
+                ops.append((DIFF_OP_INSERT, mid_target[j]))
+                j += 1
+        while i < bn:
+            ops.append((DIFF_OP_DELETE, mid_base[i]))
+            i += 1
+        while j < bm:
+            ops.append((DIFF_OP_INSERT, mid_target[j]))
+            j += 1
+    else:
+        # 一侧差异中段为空：纯删除或纯插入（另一侧为空时对应循环不执行）
+        ops.extend((DIFF_OP_DELETE, d) for d in mid_base)
+        ops.extend((DIFF_OP_INSERT, d) for d in mid_target)
+
+    ops.extend((DIFF_OP_EQUAL, d) for d in base[n - suf:])
+    return ops
+
+
+def merge_ops_into_segments(ops: list[tuple[str, str]]) -> list[ManifestDiffSegment]:
+    """把连续同类操作合并为区段：携带 base/target 半开区间与对应摘要序列。"""
+    raw: list[list] = []  # [op, base_start, target_start, digests]
+    base_pos = target_pos = 0
+    for op, digest in ops:
+        if raw and raw[-1][0] == op:
+            raw[-1][3].append(digest)
+        else:
+            raw.append([op, base_pos, target_pos, [digest]])
+        if op != DIFF_OP_INSERT:
+            base_pos += 1
+        if op != DIFF_OP_DELETE:
+            target_pos += 1
+
+    segments: list[ManifestDiffSegment] = []
+    for op, base_start, target_start, digests in raw:
+        length = len(digests)
+        segments.append(ManifestDiffSegment(
+            op=op,
+            base_start=base_start,
+            base_end=base_start + (0 if op == DIFF_OP_INSERT else length),
+            target_start=target_start,
+            target_end=target_start + (0 if op == DIFF_OP_DELETE else length),
+            digests=digests,
+        ))
+    return segments
+
+
+@app.post(
+    "/manifests/diff",
+    response_model=ManifestDiffResponse,
+    tags=["manifests"],
+    summary="比较两个已提交会话的按序分片摘要，生成最小编辑脚本（删除优先、区段合并）",
+    responses={
+        404: {"description": "任一会话不存在"},
+        409: {"description": "任一会话尚未 finalized"},
+        422: {"description": "任一会话的清单超过 MAX_MANIFEST_DIFF_ENTRIES 项"},
+    },
+)
+def diff_manifests(req: ManifestDiffRequest):
+    """仅比较两个 finalized 会话按分片序号升序排列的 chunk_digest 序列：
+    生成插入+删除次数最少的编辑脚本（多解时固定优先删除再插入），并把连续同类
+    操作合并为携带 base、target 半开区间及对应摘要的区段。已提交会话的清单
+    只读不变，本接口不做任何写入。两份清单完全相同时返回单个 equal 区段。
+    """
+    conn = get_conn()
+    base = get_session_or_404(req.base_session_id)
+    target = get_session_or_404(req.target_session_id)
+    for session in (base, target):
+        if session["status"] != "finalized":
+            return conflict(
+                "manifest diff requires finalized sessions",
+                session_id=session["id"],
+                status=session["status"],
+            )
+    # finalized 会话的清单项数即 total_chunks；超限直接拒绝，不加载分片行
+    if (base["total_chunks"] > MAX_MANIFEST_DIFF_ENTRIES
+            or target["total_chunks"] > MAX_MANIFEST_DIFF_ENTRIES):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": "manifest exceeds max entries for diff",
+                "max_entries": MAX_MANIFEST_DIFF_ENTRIES,
+                "base_total": base["total_chunks"],
+                "target_total": target["total_chunks"],
+            },
+        )
+
+    base_digests = [row["chunk_digest"] for row in conn.execute(
+        "SELECT chunk_digest FROM chunks WHERE session_id = ? ORDER BY chunk_index",
+        (req.base_session_id,),
+    ).fetchall()]
+    target_digests = [row["chunk_digest"] for row in conn.execute(
+        "SELECT chunk_digest FROM chunks WHERE session_id = ? ORDER BY chunk_index",
+        (req.target_session_id,),
+    ).fetchall()]
+
+    segments = merge_ops_into_segments(minimal_edit_script(base_digests, target_digests))
+    return ManifestDiffResponse(
+        base_session_id=req.base_session_id,
+        target_session_id=req.target_session_id,
+        base_total=len(base_digests),
+        target_total=len(target_digests),
+        deletions=sum(len(s.digests) for s in segments if s.op == DIFF_OP_DELETE),
+        insertions=sum(len(s.digests) for s in segments if s.op == DIFF_OP_INSERT),
+        segments=segments,
+    )
+
+
 # ---------------------------------------------------------------- 分片验收队列
 
 def hash_verification_token(token: str) -> str:
@@ -1796,4 +1966,5 @@ def root():
         "max_verification_ttl_seconds": MAX_VERIFICATION_TTL_SECONDS,
         "default_base_retry_seconds": DEFAULT_BASE_RETRY_SECONDS,
         "default_max_retry_seconds": DEFAULT_MAX_RETRY_SECONDS,
+        "max_manifest_diff_entries": MAX_MANIFEST_DIFF_ENTRIES,
     }
